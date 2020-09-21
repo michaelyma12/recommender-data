@@ -1,4 +1,6 @@
 import time
+import sys
+sys.path.append('/Users/michaelma/rush/recommender-data')
 
 from pyspark.sql.session import SparkSession
 from pyspark.sql.window import Window
@@ -10,7 +12,6 @@ from pipeline.dataframe_utils import *
 from google.cloud import storage
 
 # initialize spark
-sys.path.append('/Users/michaelma/rush/recommender-data')
 spark_session = SparkSession.builder.\
     appName("sample").\
     config("spark.jars", "/usr/local/Cellar/apache-spark/3.0.0/libexec/jars/gcs-connector-latest-hadoop2.jar").\
@@ -46,7 +47,7 @@ ratings = ratings.withColumn("timestamp", to_timestamp(ratings["timestamp"]))
 # add relevant data
 ratings = ratings.withColumn("target", lit(1))
 ratings = ratings.drop("rating")
-ratings = ratings.limit(100000)
+# ratings = ratings.limit(100000)
 ratings.persist()
 
 # encode user ids
@@ -77,6 +78,7 @@ save_blob.upload_from_filename(os.path.join(model_path, 'product_id_encoder.pkl'
 
 # get max values for embedding dictionaries
 stdout.write('Getting max encoded values for embedding dictionaries ...')
+max_user_id, max_product_id = np.max(list(user_id_mapping.values())), np.max(list(product_id_mapping.values()))
 max_values = ratings.select(max('user_id').alias('user_id'), max('product_id').alias('product_id')).collect()[0].asDict()
 save_pickle(max_values, os.path.join(model_path, 'embedding_max_values.pkl'))
 save_blob = storage_bucket.blob(os.path.join(model_path, 'embedding_max_values.pkl'))
@@ -84,26 +86,53 @@ save_blob.upload_from_filename(os.path.join(model_path, 'embedding_max_values.pk
 
 # create window spec for user touch windows
 spark_session.udf.register('get_last_n_elements', get_last_n_elements)
-get_last_n_elements_udf = udf(get_last_n_elements)
 stdout.write('DEBUG: Creating touched windows ...\n')
-user_window = Window.partitionBy('user_id').orderBy(asc('timestamp'))
-ratings = ratings.withColumn('touched_product_id', collect_list(col('product_id')).over(user_window))
-ratings = ratings.withColumn('last_6_product_id', get_last_n_elements_udf('touched_product_id', lit(5)))
+ratings = ratings.withColumn('timestamp', col('timestamp').cast('long'))
+user_window_preceding = Window.partitionBy('user_id').orderBy(asc('timestamp')).rowsBetween(-6, -1)
+user_window_present_reversed = Window.partitionBy('user_id').orderBy(desc('timestamp'))
+ratings = ratings.repartition(col('user_id'))
+
+stdout.write('DEBUG: Building all touched dictionary ...')
+all_touched = ratings.groupby('user_id').agg(collect_list('product_id').alias('all_touched_product_id'))
+all_touched_dict = all_touched.rdd.map(lambda row: row.asDict()).collect()
+all_touched_dict = dict([(elem['user_id'], elem['all_touched_product_id']) for elem in all_touched_dict])
+broadcasted_touched_dict = spark_session.sparkContext.broadcast(all_touched_dict)
+
+average_touched_items = np.mean([len(elems) for user, elems in all_touched_dict.items()])
+stdout.write('EVALUATION: Average touched items (non-unique) by user is ' + str(average_touched_items))
+
+ratings = ratings.withColumn('touched_product_id', collect_list(col('product_id')).over(user_window_preceding))
+# ratings = ratings.withColumn('recent_product_id', get_last_n_elements_udf('touched_product_id', lit(5)))
+ratings = ratings.withColumn('touched_product_id', sort_array('touched_product_id'))
+ratings = ratings.withColumn('rank', row_number().over(user_window_present_reversed))
+
+# build holdout set for MAP eval
+holdout_ratings = ratings.filter(col('rank') <= 5)
+prediction_states = holdout_ratings.filter(col('rank') == 5).select(
+    col('user_id'),
+    col('touched_product_id')
+)
+final_states = holdout_ratings.groupby('user_id').agg(collect_list('product_id').alias('holdout_product_id'))
+
+holdout_frame = prediction_states.join(final_states, ['user_id'])
+holdout_frame.write.parquet(os.path.join('gs://recommender-amazon-1', model_path, 'holdout'), mode='overwrite')
+
+stdout.write('Reconfigure remaining ratings for negative sampling ...')
+num_products = int(max_product_id + 1)
 ratings = ratings.drop('timestamp')
+ratings = ratings.filter(col('rank') > 5).drop('rank')
+ratings.persist()
 
 # negative sample
 stdout.write('DEBUG: Beginning negative sampling ... \n')
+negative_sampling_distributed = negative_sampling_distributed_f(broadcasted_touched_dict)
 spark_session.udf.register('negative_sampling_distributed', negative_sampling_distributed)
 negative_sampling_distributed_udf = udf(negative_sampling_distributed, ArrayType(StringType()))
-num_products = ratings.select(countDistinct('product_id')).collect()[0][0]
-ratings = ratings.withColumn('touched_product_id', sort_array('touched_product_id'))
-ratings = ratings.withColumn(
-    'negatives', negative_sampling_distributed_udf('touched_product_id', 'product_id', lit(num_products), lit(3))
+ratings_negative = ratings.withColumn(
+    'negatives', negative_sampling_distributed_udf('user_id', lit(num_products), lit(3))
 )
-ratings = ratings.drop('touched_product_id')
-ratings.persist()
 
-ratings_negative = ratings.\
+ratings_negative = ratings_negative.\
     drop('product_id').\
     withColumn('product_id', explode('negatives')).\
     drop('negatives')
@@ -116,8 +145,8 @@ ratings_all = ratings.unionByName(ratings_negative)
 ratings_all.show()
 
 stdout.write('DEBUG: Beginning stratified split ...')
-ratings_all = ratings_all.select('user_id', 'product_id', 'last_6_product_id', 'target')
-ratings_all = ratings_all.withColumnRenamed('last_6_product_id', 'touched_product_id')
+ratings_all = ratings_all.select('user_id', 'product_id', 'touched_product_id', 'target')
+# ratings_all = ratings_all.withColumnRenamed('recent_product_id', 'touched_product_id')
 train_df, val_df = stratified_split_distributed(ratings_all, 'target', spark_session)
 duration = time.time() - start_time
 stdout.write('BENCHMARKING: Runtime was ' + str(duration) + '\n')
