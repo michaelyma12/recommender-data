@@ -1,6 +1,6 @@
 import time
 import sys
-sys.path.append('/Users/michaelma/rush/recommender-data')
+sys.path.append('/recommender-data')
 
 from pyspark.sql.session import SparkSession
 from pyspark.sql.window import Window
@@ -47,7 +47,7 @@ ratings = ratings.withColumn("timestamp", to_timestamp(ratings["timestamp"]))
 # add relevant data
 ratings = ratings.withColumn("target", lit(1))
 ratings = ratings.drop("rating")
-ratings = ratings.limit(100000)
+# ratings = ratings.limit(100000)
 ratings.persist()
 
 # encode user ids
@@ -102,11 +102,25 @@ average_touched_items = np.mean([len(elems) for user, elems in all_touched_dict.
 stdout.write('EVALUATION: Average touched items (non-unique) by user is ' + str(average_touched_items))
 
 ratings = ratings.withColumn('touched_product_id', collect_list(col('product_id')).over(user_window_preceding))
+# ratings = ratings.withColumn('recent_product_id', get_last_n_elements_udf('touched_product_id', lit(5)))
 ratings = ratings.withColumn('touched_product_id', sort_array('touched_product_id'))
+ratings = ratings.withColumn('rank', row_number().over(user_window_present_reversed))
+
+# build holdout set for MAP eval
+holdout_ratings = ratings.filter(col('rank') <= 5)
+prediction_states = holdout_ratings.filter(col('rank') == 5).select(
+    col('user_id'),
+    col('touched_product_id')
+)
+final_states = holdout_ratings.groupby('user_id').agg(collect_list('product_id').alias('holdout_product_id'))
+
+holdout_frame = prediction_states.join(final_states, ['user_id'])
+holdout_frame.write.parquet(os.path.join('gs://recommender-amazon-1', model_path, 'holdout'), mode='overwrite')
 
 stdout.write('Reconfigure remaining ratings for negative sampling ...')
 num_products = int(max_product_id + 1)
 ratings = ratings.drop('timestamp')
+ratings = ratings.filter(col('rank') > 5).drop('rank')
 ratings.persist()
 
 # negative sample
@@ -125,7 +139,6 @@ ratings_negative = ratings_negative.\
 ratings_negative = ratings_negative.\
     drop('target').\
     withColumn('target', lit(0))
-ratings_negative.persist()
 
 ratings = ratings.drop('negatives')
 ratings_all = ratings.unionByName(ratings_negative)
@@ -137,16 +150,9 @@ train_df, val_df = stratified_split_distributed(ratings_all, 'target', spark_ses
 duration = time.time() - start_time
 stdout.write('BENCHMARKING: Runtime was ' + str(duration) + '\n')
 
-stdout.write('DEBUG: Converting dataframes to pandas ...' + '\n')
-train_pd = train_df.toPandas()
-train_pd.to_csv(os.path.join(model_path, 'train.csv'), index=False)
-save_blob = storage_bucket.blob(os.path.join(model_path, 'train.csv'))
-save_blob.upload_from_filename(os.path.join(model_path, 'train.csv'), timeout=7200)
-
-val_pd = val_df.toPandas()
-val_pd.to_csv(os.path.join(model_path, 'validation.csv'), index=False)
-save_blob = storage_bucket.blob(os.path.join(model_path, 'validation.csv'))
-save_blob.upload_from_filename(os.path.join(model_path, 'validation.csv'), timeout=7200)
+stdout.write('DEBUG: Converting dataframes to numpy matrices ...' + '\n')
+train_df.write.parquet(os.path.join('gs://recommender-amazon-1', model_path, 'train'), mode='overwrite')
+val_df.write.parquet(os.path.join('gs://recommender-amazon-1', model_path, 'validation'), mode='overwrite')
 
 stdout.write('DEBUG: Saving feature indices ...')
 feature_indices = dict([(feature, i) for i, feature in enumerate(ratings_all.schema.fieldNames())])
