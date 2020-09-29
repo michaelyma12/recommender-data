@@ -8,88 +8,85 @@ from pyspark.ml.feature import StringIndexer
 
 from sys import stdout
 from pipeline.file_utils import *
-from pipeline.dataframe_utils import *
-from google.cloud import storage
+from pipeline.spark_utils import *
 
 # initialize spark
 spark_session = SparkSession.builder.\
     appName("sample").\
-    config("spark.jars", "/usr/local/Cellar/apache-spark/3.0.0/libexec/jars/gcs-connector-latest-hadoop2.jar").\
-    config('spark.executor.memory', '2g').\
+    config("spark.jars", "/usr/lib/spark/jars/gcs-connector-latest-hadoop2.jar").\
+    config('spark.executor.memory', '6g').\
+    config('spark.executor.cores', '2').\
     config('spark.driver.memory', '2g').\
     getOrCreate()
 spark_session._jsc.hadoopConfiguration().set('fs.gs.impl', 'com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem')
 spark_session._jsc.hadoopConfiguration().set("google.cloud.auth.service.account.json.keyfile",
-                                             "/Users/michaelma/.gcp/credentials/VM Intro-30fcfec18d87.json")
+                                             "/recommender-data/.gcp/credentials/VM Intro-30fcfec18d87.json")
 spark_session._jsc.hadoopConfiguration().set('fs.gs.auth.service.account.enable', 'true')
 
 # setup paths
-storage_client = storage.Client()
-model_path = 'models/candidate_generation'
+model_path = 'models/luxury-beauty/candidate-generation'
 model_bucket = 'recommender-amazon-1'
-storage_bucket = storage_client.get_bucket(model_bucket)
+cg_storage = ModelStorage(bucket_name=model_bucket, model_path=model_path)
 handle_path(model_path)
 
 # load rating data
 rating_schema = StructType([
-    StructField("user_id", StringType(), True),
     StructField("product_id", StringType(), True),
+    StructField("user_id", StringType(), True),
     StructField("rating", DoubleType(), True),
     StructField("timestamp", LongType(), True)
 ])
 stdout.write('DEBUG: Reading in data ...\n')
 start_time = time.time()
-ratings = spark_session.read.csv("gs://recommender-amazon-1/data/ratings/fashion.csv",
+ratings = spark_session.read.csv("gs://recommender-amazon-1/data/ratings/luxury-beauty.csv",
                                  header=False,
                                  schema=rating_schema)
 ratings = ratings.withColumn("timestamp", to_timestamp(ratings["timestamp"]))
 
 # add relevant data
 ratings = ratings.withColumn("target", lit(1))
-ratings = ratings.drop("rating")
 # ratings = ratings.limit(100000)
-ratings.persist()
+# ratings.persist()
+
+# encode product ids
+product_id_encoder = StringIndexer().setInputCol('product_id').setOutputCol('encoded_product_id')
+product_id_model = product_id_encoder.fit(ratings)
+ratings = product_id_model.transform(ratings).withColumn('encoded_product_id', col('encoded_product_id').cast('int'))
+ratings = ratings.drop('product_id')
+ratings = ratings.withColumnRenamed('encoded_product_id', 'product_id')
+ratings = ratings.withColumn('product_id', col('product_id') + lit(1))
+
+product_id_mapping = dict([(elem, i + 1) for i, elem in enumerate(product_id_model.labels)])
+save_pickle(product_id_mapping, os.path.join(model_path, 'product_id_encoder.pkl'))
+cg_storage.save_file_gcs('product_id_encoder.pkl')
 
 # encode user ids
 stdout.write('DEBUG: Encoding categorical values ...\n')
 user_id_encoder = StringIndexer().setInputCol('user_id').setOutputCol('encoded_user_id')
 user_id_model = user_id_encoder.fit(ratings)
-ratings = user_id_model.transform(ratings).withColumn('encoded_user_id',
-                                                      col('encoded_user_id').cast('int'))
-
+ratings = user_id_model.transform(ratings).withColumn('encoded_user_id',col('encoded_user_id').cast('int'))
 ratings = ratings.drop('user_id')
 ratings = ratings.withColumnRenamed('encoded_user_id', 'user_id')
-user_id_mapping = dict([(elem, i) for i, elem in enumerate(user_id_model.labels)])
-save_pickle(user_id_mapping, os.path.join(model_path, 'user_id_encoder.pkl'))
-save_blob = storage_bucket.blob(os.path.join(model_path, 'user_id_encoder.pkl'))
-save_blob.upload_from_filename(os.path.join(model_path, 'user_id_encoder.pkl'))
+ratings = ratings.withColumn('user_id', col('user_id') + lit(1))
 
-# encode product ids
-product_id_encoder = StringIndexer().setInputCol('product_id').setOutputCol('encoded_product_id')
-product_id_model = product_id_encoder.fit(ratings)
-ratings = product_id_model.transform(ratings).withColumn('encoded_product_id',
-                                                         col('encoded_product_id').cast('int'))
-ratings = ratings.drop('product_id')
-ratings = ratings.withColumnRenamed('encoded_product_id', 'product_id')
-product_id_mapping = dict([(elem, i) for i, elem in enumerate(product_id_model.labels)])
-save_pickle(product_id_mapping, os.path.join(model_path, 'product_id_encoder.pkl'))
-save_blob = storage_bucket.blob(os.path.join(model_path, 'product_id_encoder.pkl'))
-save_blob.upload_from_filename(os.path.join(model_path, 'product_id_encoder.pkl'))
+user_id_mapping = dict([(elem, i + 1) for i, elem in enumerate(user_id_model.labels)])
+save_pickle(user_id_mapping, os.path.join(model_path, 'user_id_encoder.pkl'))
+cg_storage.save_file_gcs('user_id_encoder.pkl')
 
 # get max values for embedding dictionaries
 stdout.write('Getting max encoded values for embedding dictionaries ...')
 max_user_id, max_product_id = np.max(list(user_id_mapping.values())), np.max(list(product_id_mapping.values()))
 max_values = ratings.select(max('user_id').alias('user_id'), max('product_id').alias('product_id')).collect()[0].asDict()
 save_pickle(max_values, os.path.join(model_path, 'embedding_max_values.pkl'))
-save_blob = storage_bucket.blob(os.path.join(model_path, 'embedding_max_values.pkl'))
-save_blob.upload_from_filename(os.path.join(model_path, 'embedding_max_values.pkl'))
+cg_storage.save_file_gcs('embedding_max_values.pkl')
 
 # create window spec for user touch windows
 spark_session.udf.register('get_last_n_elements', get_last_n_elements)
 stdout.write('DEBUG: Creating touched windows ...\n')
 ratings = ratings.withColumn('timestamp', col('timestamp').cast('long'))
-user_window_preceding = Window.partitionBy('user_id').orderBy(asc('timestamp')).rowsBetween(-6, -1)
-user_window_present_reversed = Window.partitionBy('user_id').orderBy(desc('timestamp'))
+window_thres = 10
+user_window_preceding = Window.partitionBy('user_id').orderBy(asc('timestamp')).rowsBetween(-window_thres, -1)
+user_window_present = Window.partitionBy('user_id').orderBy(asc('timestamp'))
 ratings = ratings.repartition(col('user_id'))
 
 stdout.write('DEBUG: Building all touched dictionary ...')
@@ -97,34 +94,50 @@ all_touched = ratings.groupby('user_id').agg(collect_list('product_id').alias('a
 all_touched_dict = all_touched.rdd.map(lambda row: row.asDict()).collect()
 all_touched_dict = dict([(elem['user_id'], elem['all_touched_product_id']) for elem in all_touched_dict])
 broadcasted_touched_dict = spark_session.sparkContext.broadcast(all_touched_dict)
-
 average_touched_items = np.mean([len(elems) for user, elems in all_touched_dict.items()])
-stdout.write('EVALUATION: Average touched items (non-unique) by user is ' + str(average_touched_items))
+stdout.write('EVALUATION: Average touched items (non-unique) by user is ' + str(average_touched_items) + '\n')
 
-ratings = ratings.withColumn('touched_product_id', collect_list(col('product_id')).over(user_window_preceding))
-# ratings = ratings.withColumn('recent_product_id', get_last_n_elements_udf('touched_product_id', lit(5)))
-ratings = ratings.withColumn('touched_product_id', sort_array('touched_product_id'))
-ratings = ratings.withColumn('rank', row_number().over(user_window_present_reversed))
-
-# build holdout set for MAP eval
-holdout_ratings = ratings.filter(col('rank') <= 5)
-prediction_states = holdout_ratings.filter(col('rank') == 5).select(
-    col('user_id'),
-    col('touched_product_id')
+# get windows of touched items
+ratings = ratings.withColumn(
+    'liked_product_id', collect_list(when(col('rating') > 3.0, col('product_id')).otherwise(lit(None))).over(user_window_preceding)
 )
-final_states = holdout_ratings.groupby('user_id').agg(collect_list('product_id').alias('holdout_product_id'))
+ratings = ratings.withColumn(
+    'disliked_product_id', collect_list(when(col('rating') < 3.0, col('product_id')).otherwise(lit(None))).over(user_window_preceding)
+)
+ratings = ratings.withColumn('touched_product_id', collect_list(col('product_id')).over(user_window_preceding))
 
+# construct holdout set
+stdout.write('Constructing holdout set ...')
+ratings = ratings.withColumn('rank', row_number().over(user_window_present))
+holdout_thres = 10
+holdout_ratings = ratings.filter(col('rank') >= holdout_thres).\
+    drop('rank').\
+    drop('timestamp')
+prediction_states = holdout_ratings.filter(col('rank') == holdout_thres).select(
+    col('user_id'),
+    col('touched_product_id'),
+    col('liked_product_id'),
+    col('disliked_product_id')
+)
+final_states = holdout_ratings.groupby('user_id').agg(collect_set('product_id').alias('holdout_product_id'))
 holdout_frame = prediction_states.join(final_states, ['user_id'])
-holdout_frame.write.parquet(os.path.join('gs://recommender-amazon-1', model_path, 'holdout'), mode='overwrite')
 
-stdout.write('Reconfigure remaining ratings for negative sampling ...')
-num_products = int(max_product_id + 1)
-ratings = ratings.drop('timestamp')
-ratings = ratings.filter(col('rank') > 5).drop('rank')
+holdout_types = dict([(field.name, str(field.dataType)) for field in holdout_frame.schema.fields])
+save_pickle(holdout_types, os.path.join(model_path, 'holdout_types.pkl'))
+cg_storage.save_file_gcs('holdout_types.pkl')
+
+holdout_frame = holdout_frame.toPandas()
+holdout_frame.to_csv(os.path.join(model_path, 'holdout.csv'), index=False)
+cg_storage.save_file_gcs('holdout.csv')
+
+ratings = ratings.filter(col('rank') < holdout_thres).\
+    drop('rank').\
+    drop('timestamp')
 ratings.persist()
 
 # negative sample
 stdout.write('DEBUG: Beginning negative sampling ... \n')
+num_products = int(max_product_id)
 negative_sampling_distributed = negative_sampling_distributed_f(broadcasted_touched_dict)
 spark_session.udf.register('negative_sampling_distributed', negative_sampling_distributed)
 negative_sampling_distributed_udf = udf(negative_sampling_distributed, ArrayType(StringType()))
@@ -139,29 +152,35 @@ ratings_negative = ratings_negative.\
 ratings_negative = ratings_negative.\
     drop('target').\
     withColumn('target', lit(0))
+ratings_negative.persist()
 
 ratings = ratings.drop('negatives')
 ratings_all = ratings.unionByName(ratings_negative)
 ratings_all.show()
 
+# stratified split into training and validation
 stdout.write('DEBUG: Beginning stratified split ...')
-ratings_all = ratings_all.select('user_id', 'product_id', 'touched_product_id', 'target')
+ratings_all = ratings_all.select('user_id', 'product_id', 'touched_product_id',
+                                 'liked_product_id', 'disliked_product_id', 'target')
 train_df, val_df = stratified_split_distributed(ratings_all, 'target', spark_session)
 duration = time.time() - start_time
 stdout.write('BENCHMARKING: Runtime was ' + str(duration) + '\n')
 
-stdout.write('DEBUG: Converting dataframes to numpy matrices ...' + '\n')
-train_df.write.parquet(os.path.join('gs://recommender-amazon-1', model_path, 'train'), mode='overwrite')
-val_df.write.parquet(os.path.join('gs://recommender-amazon-1', model_path, 'validation'), mode='overwrite')
+stdout.write('DEBUG: Converting dataframes to pandas ...' + '\n')
+train_pd = train_df.toPandas()
+train_pd.to_csv(os.path.join(model_path, 'train.csv'), index=False)
+cg_storage.save_file_gcs('train.csv')
 
-stdout.write('DEBUG: Saving feature indices ...')
+val_pd = val_df.toPandas()
+val_pd.to_csv(os.path.join(model_path, 'validation.csv'), index=False)
+cg_storage.save_file_gcs('validation.csv')
+
+stdout.write('DEBUG: Saving feature indices ... \n')
 feature_indices = dict([(feature, i) for i, feature in enumerate(ratings_all.schema.fieldNames())])
 save_pickle(feature_indices, os.path.join(model_path, 'feature_indices.pkl'))
-save_blob = storage_bucket.blob(os.path.join(model_path, 'feature_indices.pkl'))
-save_blob.upload_from_filename(os.path.join(model_path, 'feature_indices.pkl'))
+cg_storage.save_file_gcs('feature_indices.pkl')
 
-stdout.write('DEBUG: Saving feature types ...')
+stdout.write('DEBUG: Saving feature types ... \n')
 feature_types = dict([(field.name, str(field.dataType)) for field in ratings_all.schema.fields])
 save_pickle(feature_types, os.path.join(model_path, 'feature_types.pkl'))
-save_blob = storage_bucket.blob(os.path.join(model_path, 'feature_types.pkl'))
-save_blob.upload_from_filename(os.path.join(model_path, 'feature_types.pkl'))
+cg_storage.save_file_gcs('feature_types.pkl')
